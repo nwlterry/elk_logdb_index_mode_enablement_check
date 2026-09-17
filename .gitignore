@@ -1,0 +1,4 @@
+logsdb-compare-logs/
+logsdb-monitor/
+*.log
+.DS_Store
