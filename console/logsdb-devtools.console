@@ -1,0 +1,184 @@
+# LogsDB comparison + enablement snippets
+# Paste into Kibana Dev Tools.
+# Sources:
+#   https://www.elastic.co/search-labs/blog/elasticsearch-logsdb-index-mode
+#   https://www.elastic.co/observability-labs/blog/elasticsearch-logsdb-index-mode-storage-savings
+#   https://www.elastic.co/docs/manage-data/data-store/data-streams/logs-data-stream
+#
+# Replace SOURCE with one real backing index from a high-volume log stream.
+# Example: .ds-logs-system.syslog-default-2026.09.16-000042
+
+# ---------------------------------------------------------------------------
+# 0. Baseline: version, license, what is already LogsDB
+# ---------------------------------------------------------------------------
+
+GET /?filter_path=version.number
+
+GET /_license?filter_path=license.type,license.status,license.expiry_date
+
+# Enterprise => synthetic _source auto-on with logsdb (extra 20-40% saving).
+# Standard/Gold/Platinum => stored _source; you still get sort + ZSTD.
+
+GET /.ds-logs-*/_settings?filter_path=**.index.mode
+
+GET _cat/indices/.ds-logs-*?v&h=index,docs.count,pri.store.size,store.size&s=pri.store.size:desc
+
+GET _data_stream/logs-*
+
+# ---------------------------------------------------------------------------
+# 1. Canary indices (blog method). 1 shard / 0 replicas.
+#    LogsDB automatically applies:
+#      index.sort.field = host.name, @timestamp
+#      index.codec      = best_compression
+#      ignore_malformed / ignore_above defaults
+# ---------------------------------------------------------------------------
+
+PUT /cmp-logsdb-standard
+{
+  "settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 0,
+    "refresh_interval": "30s"
+  }
+}
+
+PUT /cmp-logsdb-logsdb
+{
+  "settings": {
+    "index.mode": "logsdb",
+    "number_of_shards": 1,
+    "number_of_replicas": 0,
+    "refresh_interval": "30s"
+  }
+}
+
+# Optional: confirm hidden settings LogsDB injected
+GET /cmp-logsdb-logsdb/_settings?flat_settings=true&include_defaults=false
+
+# ---------------------------------------------------------------------------
+# 2. Same documents into both arms. Cap max_docs on first run.
+# ---------------------------------------------------------------------------
+
+POST /_reindex?wait_for_completion=true&refresh=true
+{
+  "source": { "index": "SOURCE", "size": 2000 },
+  "dest":   { "index": "cmp-logsdb-standard" },
+  "max_docs": 200000
+}
+
+POST /_reindex?wait_for_completion=true&refresh=true
+{
+  "source": { "index": "SOURCE", "size": 2000 },
+  "dest":   { "index": "cmp-logsdb-logsdb" },
+  "max_docs": 200000
+}
+
+GET /cmp-logsdb-standard/_count
+GET /cmp-logsdb-logsdb/_count
+
+# ---------------------------------------------------------------------------
+# 3. Collapse to 1 segment so store size is comparable
+#    (canaries only — never force-merge a live hot write index)
+# ---------------------------------------------------------------------------
+
+POST /cmp-logsdb-standard/_forcemerge?max_num_segments=1
+POST /cmp-logsdb-logsdb/_forcemerge?max_num_segments=1
+
+# ---------------------------------------------------------------------------
+# 4. Measure (primaries.store.size_in_bytes)
+# ---------------------------------------------------------------------------
+
+GET /cmp-logsdb-standard/_stats?filter_path=indices.*.primaries.docs,indices.*.primaries.store,indices.*.primaries.indexing,indices.*.primaries.merges
+GET /cmp-logsdb-logsdb/_stats?filter_path=indices.*.primaries.docs,indices.*.primaries.store,indices.*.primaries.indexing,indices.*.primaries.merges
+
+GET _cat/indices/cmp-logsdb-*?v&h=index,docs.count,pri.store.size,store.size
+
+# Where the bytes went
+GET /cmp-logsdb-standard/_disk_usage?run_expensive_tasks=true
+GET /cmp-logsdb-logsdb/_disk_usage?run_expensive_tasks=true
+
+# ---------------------------------------------------------------------------
+# 5. Query sanity on YOUR real patterns (edit the query body)
+# ---------------------------------------------------------------------------
+
+POST /cmp-logsdb-standard/_search
+{
+  "size": 0,
+  "query": {
+    "range": { "@timestamp": { "gte": "now-24h" } }
+  },
+  "aggs": {
+    "hosts": { "terms": { "field": "host.name", "size": 20 } }
+  }
+}
+
+POST /cmp-logsdb-logsdb/_search
+{
+  "size": 0,
+  "query": {
+    "range": { "@timestamp": { "gte": "now-24h" } }
+  },
+  "aggs": {
+    "hosts": { "terms": { "field": "host.name", "size": 20 } }
+  }
+}
+
+# ---------------------------------------------------------------------------
+# 6. Cleanup canaries
+# ---------------------------------------------------------------------------
+
+DELETE /cmp-logsdb-standard
+DELETE /cmp-logsdb-logsdb
+
+# ---------------------------------------------------------------------------
+# 7. Production enablement on ONE stream (8.18.x)
+#    Prefer @custom so Fleet-managed templates are not overwritten.
+#    Takes effect on the NEXT rollover only.
+# ---------------------------------------------------------------------------
+
+# Discover the template / component chain
+GET _index_template/logs-*
+GET _component_template/*@custom
+
+# Example: enable LogsDB for a single integration dataset
+# Adjust the component name to match the dataset (logs-system.syslog@custom etc.)
+
+PUT _component_template/logs-system.syslog@custom
+{
+  "template": {
+    "settings": {
+      "index.mode": "logsdb"
+    }
+  }
+}
+
+# Optional Enterprise extra (~20% more storage, 1-4% ingest tax) on 8.18+:
+#   "index.logsdb.route_on_sort_fields": true
+# Requires useful sort fields besides @timestamp.
+
+# Apply immediately to the write index
+POST /logs-system.syslog-default/_rollover
+
+# Confirm the NEW backing index is logsdb; old ones stay standard
+GET /logs-system.syslog-default/_settings?filter_path=**.index.mode
+GET _data_stream/logs-system.syslog-default
+
+# ---------------------------------------------------------------------------
+# 8. Watch resources after rollover (hot tier)
+# ---------------------------------------------------------------------------
+
+GET _nodes/stats/os,jvm,fs,indices?filter_path=nodes.*.name,nodes.*.os.cpu,nodes.*.jvm.mem.heap_used_percent,nodes.*.fs.total,nodes.*.indices.indexing,nodes.*.indices.merge
+
+GET _cat/thread_pool/write,search,force_merge?v&h=node_name,name,active,queue,rejected,completed
+
+GET _cluster/health
+GET _cluster/pending_tasks
+
+# ---------------------------------------------------------------------------
+# 9. Rollback the canary stream (next rollover returns to standard)
+# ---------------------------------------------------------------------------
+
+# Remove index.mode from the @custom template (PUT the template without it,
+# or delete the custom template if it only existed for this change), then:
+# POST /logs-system.syslog-default/_rollover
+# Existing LogsDB backing indices keep their mode until they age out via ILM.
